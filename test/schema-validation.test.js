@@ -6,6 +6,33 @@ const Fastify = require('..')
 const AJV = require('ajv')
 const Schema = require('fluent-json-schema')
 const { waitForCb } = require('./toolkit')
+const Ajv2019 = require('ajv/dist/2019')
+const { FSTSEC002 } = require('../lib/warnings')
+const { compileSchemasForValidation } = require('../lib/validation')
+
+// Minimal stand-in for process-warning's `spyWarning` helper, which is not
+// available in the process-warning version used here: records every emitted
+// warning carrying the same code as the given warning.
+function spyWarning (warning) {
+  const calls = []
+  function onWarning (emitted) {
+    if (emitted.code === warning.code) {
+      calls.push(emitted)
+    }
+  }
+  process.on('warning', onWarning)
+  return {
+    calls,
+    callCount: () => calls.length,
+    restore () {
+      process.removeListener('warning', onWarning)
+      warning.emitted = false
+    }
+  }
+}
+
+// `process.emitWarning` dispatches the 'warning' event asynchronously.
+const flushWarnings = () => new Promise(resolve => setImmediate(resolve))
 
 const customSchemaCompilers = {
   body: new AJV({
@@ -1590,4 +1617,422 @@ test('Schema validation will not be bypass by different content type', async t =
   })
   t.assert.strictEqual(found.status, 415)
   t.assert.strictEqual((await found.json()).code, 'FST_ERR_CTP_INVALID_MEDIA_TYPE')
+})
+
+test('header schema dependencies with canonical-case names are enforced', async t => {
+  const fastify = Fastify()
+
+  fastify.get('/', {
+    schema: {
+      headers: {
+        type: 'object',
+        properties: {
+          'X-Admin': { type: 'string', const: 'true' },
+          'X-Admin-Token': { type: 'string', const: 'server-secret' }
+        },
+        dependencies: {
+          'X-Admin': ['X-Admin-Token']
+        }
+      }
+    }
+  }, async () => {
+    return { adminAction: true }
+  })
+
+  await fastify.ready()
+
+  // Missing the token required by the dependency must be rejected even though
+  // the dependency trigger is written in canonical case. Node.js stores the
+  // received header as `x-admin`, and the normalized schema must lowercase the
+  // dependency trigger so Ajv sees it and enforces the token assertion.
+  const missingToken = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true' }
+  })
+  t.assert.strictEqual(missingToken.statusCode, 400)
+  t.assert.strictEqual(missingToken.json().code, 'FST_ERR_VALIDATION')
+
+  // Direct property constraints remain active: a wrong token is rejected too.
+  const wrongToken = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true', 'X-Admin-Token': 'wrong' }
+  })
+  t.assert.strictEqual(wrongToken.statusCode, 400)
+  t.assert.strictEqual(wrongToken.json().code, 'FST_ERR_VALIDATION')
+
+  const valid = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true', 'X-Admin-Token': 'server-secret' }
+  })
+  t.assert.strictEqual(valid.statusCode, 200)
+  t.assert.deepStrictEqual(valid.json(), { adminAction: true })
+})
+
+test('header schema dependencies: lowercase-equivalent schema behaves identically', async t => {
+  const fastify = Fastify()
+
+  fastify.get('/', {
+    schema: {
+      headers: {
+        type: 'object',
+        properties: {
+          'x-admin': { type: 'string', const: 'true' },
+          'x-admin-token': { type: 'string', const: 'server-secret' }
+        },
+        dependencies: {
+          'x-admin': ['x-admin-token']
+        }
+      }
+    }
+  }, async () => {
+    return { adminAction: true }
+  })
+
+  await fastify.ready()
+
+  const missingToken = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true' }
+  })
+  t.assert.strictEqual(missingToken.statusCode, 400)
+  t.assert.strictEqual(missingToken.json().code, 'FST_ERR_VALIDATION')
+
+  const wrongToken = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true', 'X-Admin-Token': 'wrong' }
+  })
+  t.assert.strictEqual(wrongToken.statusCode, 400)
+  t.assert.strictEqual(wrongToken.json().code, 'FST_ERR_VALIDATION')
+
+  const valid = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true', 'X-Admin-Token': 'server-secret' }
+  })
+  t.assert.strictEqual(valid.statusCode, 200)
+  t.assert.deepStrictEqual(valid.json(), { adminAction: true })
+})
+
+test('header schema dependencies are normalized in nested subschemas', async t => {
+  const fastify = Fastify()
+
+  // The dependency lives inside an `allOf` subschema; its trigger and dependent
+  // names must be lowercased the same way as root-level `dependencies`.
+  fastify.get('/', {
+    schema: {
+      headers: {
+        type: 'object',
+        allOf: [{
+          properties: { 'X-Admin': { type: 'string', const: 'true' } },
+          dependencies: { 'X-Admin': ['X-Admin-Token'] }
+        }]
+      }
+    }
+  }, async () => {
+    return { ok: true }
+  })
+
+  await fastify.ready()
+
+  const missingToken = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true' }
+  })
+  t.assert.strictEqual(missingToken.statusCode, 400)
+  t.assert.strictEqual(missingToken.json().code, 'FST_ERR_VALIDATION')
+
+  const valid = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true', 'X-Admin-Token': 'server-secret' }
+  })
+  t.assert.strictEqual(valid.statusCode, 200)
+})
+
+test('header schema dependencies are normalized in local $ref definitions', async t => {
+  const fastify = Fastify()
+
+  fastify.get('/', {
+    schema: {
+      headers: {
+        $ref: '#/definitions/Headers',
+        definitions: {
+          Headers: {
+            type: 'object',
+            properties: {
+              'X-Admin': { type: 'string', const: 'true' },
+              'X-Admin-Token': { type: 'string', const: 'server-secret' }
+            },
+            dependencies: {
+              'X-Admin': ['X-Admin-Token']
+            }
+          }
+        }
+      }
+    }
+  }, async () => {
+    return { ok: true }
+  })
+
+  await fastify.ready()
+
+  const missingToken = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true' }
+  })
+  t.assert.strictEqual(missingToken.statusCode, 400)
+  t.assert.strictEqual(missingToken.json().code, 'FST_ERR_VALIDATION')
+
+  const valid = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true', 'X-Admin-Token': 'server-secret' }
+  })
+  t.assert.strictEqual(valid.statusCode, 200)
+})
+
+test('header schema dependencies: subschema-form dependency values are normalized', async t => {
+  const fastify = Fastify()
+
+  fastify.get('/', {
+    schema: {
+      headers: {
+        type: 'object',
+        properties: { 'X-Admin': { type: 'string', const: 'true' } },
+        dependencies: {
+          'X-Admin': {
+            properties: { 'X-Admin-Token': { type: 'string', const: 'server-secret' } },
+            required: ['X-Admin-Token']
+          }
+        }
+      }
+    }
+  }, async () => {
+    return { ok: true }
+  })
+
+  await fastify.ready()
+
+  const missingToken = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true' }
+  })
+  t.assert.strictEqual(missingToken.statusCode, 400)
+  t.assert.strictEqual(missingToken.json().code, 'FST_ERR_VALIDATION')
+
+  const valid = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true', 'X-Admin-Token': 'server-secret' }
+  })
+  t.assert.strictEqual(valid.statusCode, 200)
+})
+
+test('header schema lowercasing does not mutate the input schema', async t => {
+  const headers = {
+    type: 'object',
+    properties: {
+      'X-Admin': { type: 'string', const: 'true' },
+      'X-Admin-Token': { type: 'string', const: 'server-secret' }
+    },
+    dependencies: {
+      'X-Admin': ['X-Admin-Token']
+    }
+  }
+  const schema = { headers }
+  const schemaBefore = JSON.stringify(schema)
+  const headersBefore = JSON.stringify(headers)
+
+  const fastify = Fastify()
+  fastify.get('/', { schema }, async () => {
+    return { ok: true }
+  })
+  await fastify.ready()
+
+  t.assert.strictEqual(JSON.stringify(schema), schemaBefore)
+  t.assert.strictEqual(JSON.stringify(headers), headersBefore)
+})
+
+test('header schema with an external $ref emits FSTSEC002 (case-normalization does not reach it)', async t => {
+  const spyData = spyWarning(FSTSEC002)
+  t.after(spyData.restore)
+
+  const fastify = Fastify()
+  fastify.addSchema({
+    $id: 'http://example.com/admin-headers',
+    type: 'object',
+    properties: {
+      'X-Admin': { type: 'string', const: 'true' },
+      'X-Admin-Token': { type: 'string', const: 'server-secret' }
+    },
+    dependencies: { 'X-Admin': ['X-Admin-Token'] }
+  })
+  fastify.post('/', {
+    schema: { headers: { $ref: 'http://example.com/admin-headers#' } }
+  }, async () => ({ ok: true }))
+
+  await fastify.ready()
+  await flushWarnings()
+
+  t.assert.strictEqual(spyData.callCount(), 1)
+  t.assert.strictEqual(spyData.calls[0].name, 'FastifySecurity')
+  t.assert.strictEqual(spyData.calls[0].message, FSTSEC002.format('POST', '/', 'http://example.com/admin-headers#'))
+})
+
+test('inline and local $ref header schemas do not emit FSTSEC002', async t => {
+  const spyData = spyWarning(FSTSEC002)
+  t.after(spyData.restore)
+
+  const fastify = Fastify()
+  // inline header schema
+  fastify.get('/inline', {
+    schema: {
+      headers: {
+        type: 'object',
+        properties: { 'X-Admin': { type: 'string' } },
+        dependencies: { 'X-Admin': ['X-Admin-Token'] }
+      }
+    }
+  }, async () => ({ ok: true }))
+  // local same-document $ref header schema
+  fastify.get('/local', {
+    schema: {
+      headers: {
+        type: 'object',
+        $ref: '#/definitions/h',
+        definitions: {
+          h: {
+            type: 'object',
+            properties: { 'X-Admin': { type: 'string' } },
+            dependencies: { 'X-Admin': ['X-Admin-Token'] }
+          }
+        }
+      }
+    }
+  }, async () => ({ ok: true }))
+
+  await fastify.ready()
+  await flushWarnings()
+
+  t.assert.strictEqual(spyData.callCount(), 0)
+})
+
+test('header schema names are normalized in if/then conditional subschemas', async t => {
+  const fastify = Fastify()
+
+  // Without normalization the `if` subschema never matches the lowercased
+  // request headers, so the `then` assertion is silently skipped.
+  fastify.get('/', {
+    schema: {
+      headers: {
+        type: 'object',
+        if: {
+          properties: { 'X-Admin': { const: 'true' } },
+          required: ['X-Admin']
+        },
+        then: {
+          properties: { 'X-Admin-Token': { type: 'string', const: 'server-secret' } },
+          required: ['X-Admin-Token']
+        }
+      }
+    }
+  }, async () => {
+    return { ok: true }
+  })
+
+  await fastify.ready()
+
+  const missingToken = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true' }
+  })
+  t.assert.strictEqual(missingToken.statusCode, 400)
+  t.assert.strictEqual(missingToken.json().code, 'FST_ERR_VALIDATION')
+
+  const wrongToken = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true', 'X-Admin-Token': 'wrong' }
+  })
+  t.assert.strictEqual(wrongToken.statusCode, 400)
+  t.assert.strictEqual(wrongToken.json().code, 'FST_ERR_VALIDATION')
+
+  const valid = await fastify.inject({
+    method: 'GET',
+    url: '/',
+    headers: { 'X-Admin': 'true', 'X-Admin-Token': 'server-secret' }
+  })
+  t.assert.strictEqual(valid.statusCode, 200)
+
+  const notAdmin = await fastify.inject({
+    method: 'GET',
+    url: '/'
+  })
+  t.assert.strictEqual(notAdmin.statusCode, 200)
+})
+
+// The default Fastify validator compiles draft-07 schemas, so the draft
+// 2019-09 `dependentRequired` / `dependentSchemas` keywords are exercised by
+// compiling the normalized header schema with a draft 2019-09 Ajv instance.
+function compileNormalizedHeadersSchema (headers) {
+  let headersSchema
+  const context = { schema: { headers }, config: { method: 'GET', url: '/' } }
+  compileSchemasForValidation(context, ({ schema, httpPart }) => {
+    if (httpPart === 'headers') {
+      headersSchema = schema
+    }
+    return () => true
+  }, false)
+  return headersSchema
+}
+
+test('header schema dependentRequired names are normalized', async t => {
+  const headersSchema = compileNormalizedHeadersSchema({
+    type: 'object',
+    properties: {
+      'X-Admin': { type: 'string', const: 'true' }
+    },
+    dependentRequired: {
+      'X-Admin': ['X-Admin-Token']
+    }
+  })
+
+  t.assert.deepStrictEqual(headersSchema.dependentRequired, { 'x-admin': ['x-admin-token'] })
+
+  const validate = new Ajv2019().compile(headersSchema)
+  t.assert.strictEqual(validate({ 'x-admin': 'true' }), false)
+  t.assert.strictEqual(validate({ 'x-admin': 'true', 'x-admin-token': 'server-secret' }), true)
+})
+
+test('header schema dependentSchemas names are normalized', async t => {
+  const headersSchema = compileNormalizedHeadersSchema({
+    type: 'object',
+    properties: {
+      'X-Admin': { type: 'string', const: 'true' }
+    },
+    dependentSchemas: {
+      'X-Admin': {
+        type: 'object',
+        properties: { 'X-Admin-Token': { type: 'string', const: 'server-secret' } },
+        required: ['X-Admin-Token']
+      }
+    }
+  })
+
+  t.assert.deepStrictEqual(Object.keys(headersSchema.dependentSchemas), ['x-admin'])
+  t.assert.deepStrictEqual(headersSchema.dependentSchemas['x-admin'].required, ['x-admin-token'])
+
+  const validate = new Ajv2019().compile(headersSchema)
+  t.assert.strictEqual(validate({ 'x-admin': 'true' }), false)
+  t.assert.strictEqual(validate({ 'x-admin': 'true', 'x-admin-token': 'wrong' }), false)
+  t.assert.strictEqual(validate({ 'x-admin': 'true', 'x-admin-token': 'server-secret' }), true)
 })
