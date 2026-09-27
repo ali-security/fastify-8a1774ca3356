@@ -1,6 +1,9 @@
 'use strict'
 
 const { test } = require('node:test')
+const http2 = require('node:http2')
+const { Readable } = require('node:stream')
+const { ReadableStream } = require('node:stream/web')
 const Fastify = require('../..')
 const h2url = require('h2url')
 const msg = { hello: 'world' }
@@ -66,3 +69,105 @@ test('http2 plain test', async t => {
     t.assert.strictEqual(JSON.parse(res.body).port, parseInt(host.split(':')[1]))
   })
 })
+
+test('http2 response trailers do not use transfer-encoding', async t => {
+  const fastify = Fastify({ http2: true })
+
+  fastify.get('/', async (request, reply) => {
+    reply.trailer('x-checksum', async () => 'abc')
+    return 'hello'
+  })
+
+  await fastify.listen({ port: 0, host: '127.0.0.1' })
+
+  const client = http2.connect(`http://127.0.0.1:${fastify.server.address().port}`)
+  t.after(() => {
+    client.close()
+    return fastify.close()
+  })
+
+  const response = await new Promise((resolve, reject) => {
+    const request = client.request({
+      [http2.constants.HTTP2_HEADER_METHOD]: http2.constants.HTTP2_METHOD_GET,
+      [http2.constants.HTTP2_HEADER_PATH]: '/'
+    })
+    const result = { body: '' }
+
+    request.setEncoding('utf8')
+    request.on('response', headers => {
+      result.headers = headers
+    })
+    request.on('trailers', trailers => {
+      result.trailers = trailers
+    })
+    request.on('data', chunk => {
+      result.body += chunk
+    })
+    request.on('error', reject)
+    request.on('end', () => resolve(result))
+    request.end()
+  })
+
+  t.assert.strictEqual(response.headers[':status'], 200)
+  t.assert.strictEqual(response.headers['transfer-encoding'], undefined)
+  t.assert.strictEqual(response.headers.trailer, 'x-checksum')
+  t.assert.strictEqual(response.body, 'hello')
+  t.assert.strictEqual(response.trailers['x-checksum'], 'abc')
+})
+
+const streamPayloads = {
+  'node stream': () => Readable.from(['hello']),
+  'web stream': () => new ReadableStream({
+    start (controller) {
+      controller.enqueue(Buffer.from('hello'))
+      controller.close()
+    }
+  })
+}
+
+for (const [mode, createPayload] of Object.entries(streamPayloads)) {
+  test(`http2 ${mode} response trailers do not use transfer-encoding`, async t => {
+    const fastify = Fastify({ http2: true })
+
+    fastify.get('/', (request, reply) => {
+      reply.trailer('x-checksum', async () => 'abc')
+      reply.send(createPayload())
+    })
+
+    await fastify.listen({ port: 0, host: '127.0.0.1' })
+
+    const client = http2.connect(`http://127.0.0.1:${fastify.server.address().port}`)
+    t.after(() => {
+      client.close()
+      return fastify.close()
+    })
+
+    const response = await new Promise((resolve, reject) => {
+      const request = client.request({
+        [http2.constants.HTTP2_HEADER_METHOD]: http2.constants.HTTP2_METHOD_GET,
+        [http2.constants.HTTP2_HEADER_PATH]: '/'
+      })
+      const result = { body: '' }
+
+      request.setEncoding('utf8')
+      request.on('response', headers => {
+        result.headers = headers
+      })
+      request.on('trailers', trailers => {
+        result.trailers = trailers
+      })
+      request.on('data', chunk => {
+        result.body += chunk
+      })
+      request.on('error', reject)
+      request.on('end', () => resolve(result))
+      request.end()
+    })
+
+    t.assert.strictEqual(response.headers[':status'], 200)
+    t.assert.strictEqual(response.headers['transfer-encoding'], undefined)
+    t.assert.strictEqual(response.headers.trailer, 'x-checksum')
+    t.assert.strictEqual(response.body, 'hello')
+    t.assert.strictEqual(response.trailers['x-checksum'], 'abc')
+  })
+}
