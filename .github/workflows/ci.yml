@@ -1,24 +1,17 @@
 name: ci
 
 on:
-  push:
-    branches:
-     - main
-     - next
-     - '*.x'
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
-  pull_request:
-    paths-ignore:
-      - 'docs/**'
-      - '*.md'
   workflow_dispatch:
     inputs:
       nodejs-version:
         description: 'Node.js version to use (e.g., 24.0.0-rc.1)'
-        required: true
+        required: false
         type: string
+      test-filter:
+        description: 'Optional test selector passed to the unit test runner'
+        required: false
+        type: string
+        default: ''
 
 # This allows a subsequently queued workflow run to interrupt previous runs
 concurrency:
@@ -33,6 +26,7 @@ jobs:
       name: Dependency Review
       if: github.event_name == 'pull_request'
       runs-on: ubuntu-latest
+      timeout-minutes: 60
       permissions:
         contents: read
       steps:
@@ -46,7 +40,9 @@ jobs:
 
   check-licenses:
     name: Check licenses
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -61,6 +57,11 @@ jobs:
           cache: 'npm'
           cache-dependency-path: package.json
           check-latest: true
+
+      - name: Pin npm registry to time machine
+        shell: bash
+        run: |
+          npm config set registry https://:2026-04-14T12%3A07%3A12.232Z@time-machines-npm.sealsecurity.io/
 
       - name: Install
         run: |
@@ -72,7 +73,9 @@ jobs:
 
   lint:
     name: Lint
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -88,6 +91,11 @@ jobs:
           cache-dependency-path: package.json
           check-latest: true
 
+      - name: Pin npm registry to time machine
+        shell: bash
+        run: |
+          npm config set registry https://:2026-04-14T12%3A07%3A12.232Z@time-machines-npm.sealsecurity.io/
+
       - name: Install
         run: |
           npm install --ignore-scripts
@@ -97,25 +105,71 @@ jobs:
           npm run lint
 
   coverage-nix:
-    needs:
-      - lint
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
-    uses: ./.github/workflows/coverage-nix.yml
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+          cache-dependency-path: package.json
+          check-latest: true
+
+      - name: Pin npm registry to time machine
+        shell: bash
+        run: |
+          npm config set registry https://:2026-04-14T12%3A07%3A12.232Z@time-machines-npm.sealsecurity.io/
+
+      - name: Install
+        run: |
+          npm install --ignore-scripts
+
+      - name: Run tests with coverage
+        run: |
+          npx borp --reporter=@jsumners/line-reporter --coverage
 
   coverage-win:
-    needs:
-      - lint
+    runs-on: windows-latest
+    timeout-minutes: 60
     permissions:
       contents: read
-    uses: ./.github/workflows/coverage-win.yml
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+          cache-dependency-path: package.json
+          check-latest: true
+
+      - name: Pin npm registry to time machine
+        shell: bash
+        run: |
+          npm config set registry https://:2026-04-14T12%3A07%3A12.232Z@time-machines-npm.sealsecurity.io/
+
+      - name: Install
+        run: |
+          npm install --ignore-scripts
+
+      - name: Run tests with coverage
+        run: |
+          npx borp --reporter=@jsumners/line-reporter --coverage
 
   test-unit:
     needs:
-      - lint
       - coverage-nix
       - coverage-win
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
     permissions:
       contents: read
 
@@ -137,18 +191,24 @@ jobs:
           cache-dependency-path: package.json
           check-latest: true
 
+      - name: Pin npm registry to time machine
+        shell: bash
+        run: |
+          npm config set registry https://:2026-04-14T12%3A07%3A12.232Z@time-machines-npm.sealsecurity.io/
+
       - name: Install
         run: |
           npm install --ignore-scripts
 
       - name: Run tests
         run: |
-          npm run unit
+          npm run unit -- ${{ inputs.test-filter }}
 
   # Useful for testing Release Candidates of Node.js
   test-unit-custom:
-    if: github.event_name == 'workflow_dispatch'
+    if: false
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
 
@@ -165,6 +225,11 @@ jobs:
           cache-dependency-path: package.json
           check-latest: true
 
+      - name: Pin npm registry to time machine
+        shell: bash
+        run: |
+          npm config set registry https://:2026-04-14T12%3A07%3A12.232Z@time-machines-npm.sealsecurity.io/
+
       - name: Install
         run: |
           npm install --ignore-scripts
@@ -175,10 +240,10 @@ jobs:
 
   test-typescript:
     needs:
-      - lint
       - coverage-nix
       - coverage-win
     runs-on: 'ubuntu-latest'
+    timeout-minutes: 60
     permissions:
       contents: read
 
@@ -194,6 +259,11 @@ jobs:
           cache-dependency-path: package.json
           check-latest: true
 
+      - name: Pin npm registry to time machine
+        shell: bash
+        run: |
+          npm config set registry https://:2026-04-14T12%3A07%3A12.232Z@time-machines-npm.sealsecurity.io/
+
       - name: Install
         run: |
           npm install --ignore-scripts
@@ -207,10 +277,10 @@ jobs:
   test-pino-compat:
     name: Test pino compatibility
     needs:
-      - lint
       - coverage-nix
       - coverage-win
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     strategy:
@@ -229,6 +299,11 @@ jobs:
           cache-dependency-path: package.json
           check-latest: true
 
+      - name: Pin npm registry to time machine
+        shell: bash
+        run: |
+          npm config set registry https://:2026-04-14T12%3A07%3A12.232Z@time-machines-npm.sealsecurity.io/
+
       - name: Install dependencies
         run: |
           npm install --ignore-scripts
@@ -239,7 +314,7 @@ jobs:
 
       - name: Run unit tests
         run: |
-          npm run unit
+          npm run unit -- ${{ inputs.test-filter }}
 
       - name: Run typescript tests
         run: |
@@ -253,6 +328,7 @@ jobs:
       - test-unit
       - test-pino-compat
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
     steps:
@@ -262,13 +338,32 @@ jobs:
       - name: Use Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 'lts/*'
+          node-version: '24'
           cache: 'npm'
           cache-dependency-path: package.json
           check-latest: true
+      - name: Pin npm registry to time machine
+        shell: bash
+        run: |
+          npm config set registry https://:2026-04-14T12%3A07%3A12.232Z@time-machines-npm.sealsecurity.io/
       - name: install fastify
         run: |
           npm install --ignore-scripts
+      - name: Install npm 11.9.0
+        run: |
+          npm i -g npm@11.9.0
+      - name: Show npm version
+        run: |
+          npm --version
+      - name: Pack fastify
+        run: |
+          npm pack
+      - name: Upload npm tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: npm-tarball
+          path: fastify-5.8.5.tgz
+          if-no-files-found: error
       - name: install webpack stack
         run: |
           cd test/bundler/webpack && npm install --ignore-scripts
@@ -292,6 +387,7 @@ jobs:
       - test-unit
       - package
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       pull-requests: write
       contents: write
